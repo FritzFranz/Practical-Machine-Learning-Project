@@ -1,0 +1,234 @@
+---
+title: "Practical Machine Learning Project"
+author: "FJF"
+date: "Wednesday, October 22, 2014"
+output: html_document
+---
+
+### Introduction
+
+Source of data: "Human Activity Recognition"
+http://groupware.les.inf.puc-rio.br/har  
+
+#### Step 1: Get full dataset
+
+For ease of use, we work with a downloaded copy of the data. 
+
+```{r Data}
+# url= "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+destfile = "PML Wearable.csv"
+# download.file(url, destfile)
+# training = read.csv(url)
+training = read.csv(destfile)
+dim0 = dim(training)  # 19622 obs, 160 variables 
+dim0
+```
+
+#### Step 1B: Create cross-validation set 
+
+In order to estimate the "out-of-sample error", we split 20% of the given 
+training set to create a cross validation (CV) set and we use the remaining
+80% as the proper training set. 
+
+```{r Creeate_CV,comment=""}
+library(caret, verbose=F)
+cvIndex = createDataPartition(training$classe, 
+                                p = 0.20,list=FALSE)  # create CV indices
+train0 = training[-cvIndex,]                          # select training
+cv0 = training[cvIndex,]                              # select CV
+dim(train0);dim(cv0)                                  # check dimensions 
+```
+
+#### Step 2: Remove NA-variables and other unrelated or problematic variables
+  
+We see that the outcome (classe) is grouped by the observation number (X) 
+Therefore we need to exclude X from all inference attempts. 
+Also we will exclude the timestamps.  
+
+```{r Data_Explore_2A,comment=""}
+# observations are sorted by classe 
+boxplot(X ~ classe, data=train0)
+```
+
+Analysis shows that there are some variables with very many
+NA-values. We remove these variables (the numbers of NA values per variable
+are either 0 or very high, see detailed output below).
+
+```{r Data_Explore_2B,comment=""}
+dim0 = dim(train0)
+
+ex1 = sapply(train0, function(x) sum(is.na(x)))    # count NA per variable                                                # we see 0 or high counts   
+options(width=100)
+ex1[ex1 > 0]
+ex2 = as.vector(which(ex1 > 0))                    # get indices
+# create training set with exclusion of highly NA variables 
+train2 = train0[,-ex2]                             # remove NA-variables 
+train2 = train2[,-(1:7)]    # remove first 7 variables 
+dim2 = dim(train2)
+```
+
+#### Step 3: Remove highly correlated numerical variables 
+
+We check each pair of numerical variables for a corrleation
+with absolute value > 0.8. In such a case, we mark the second variable
+for removal and we do not check that second variable for further correlations.
+
+```{r Data_Explore_2,comment=""}
+elim = c()                  # collect variables to be eliminated 
+for (i1 in 1:dim2[[2]])     # loop over all variables 
+    {
+        if (i1 %in% elim)   # skip if already eliminated
+            next; 
+        cl1 = class(train2[[i1]])         # check class for numeric 
+        check_num1 = (cl1 %in% c("integer", "numeric"))
+        if (!check_num1)  next;
+        for (i2 in (i1+1):dim2[[2]])     # check against further var
+            {
+                if (i2 %in% elim)  next;
+                cl2 = class(train2[[i2]])
+                check_num2 = (cl2 %in% c("integer", "numeric"))
+                if (!check_num2)  next;          
+                r = cor(train2[[i1]], train2[[i2]])
+                if (abs(r) <= 0.8)  next;
+                name1 = names(train2)[i1]
+                name2 = names(train2)[i2]
+                cat("\n i1=",i1, "=",names(train2)[i1],
+                    "  i2=", i2, "=",names(train2)[i2], 
+                    "   cor=", cor(train2[[i1]], train2[[i2]]))
+                elim = c(elim, i2)
+            } # inner loop     
+    } # outer loop 
+train3 = train2[,-elim]           # remove highly correlated variables
+dim3 = dim(train3)
+```
+
+#### Step 4: Check factorial variables 
+
+We check factorial variables for   
+(1) independence from variable "classe" (with chi-squared-test)  
+(2) proportion of the most frequent value
+
+Factorial variables which are pretty much independen from the outcome 
+variable "classe"", can be removed. 
+In addition, we eliminate all factorial variables which have a very dominating 
+single value, because we cannot expect them to be good predictors.
+
+```{r Data_Explore_3,comment=""}
+elimf = c()
+for (i in 1:dim3[[2]])
+    {
+        namei = names(train3)[i]    
+        classi = class(train3[[i]])
+        if (classi == "factor")
+            {
+                tf = table(train3[[i]])
+                num_lev = length(tf)
+                cat("\n i=", i,"  name=", names(train3)[[i]], 
+                    "  levels=", num_lev)
+                max_tf = max(tf)
+                if (max_tf / dim3[[1]] > 0.5 )
+                {
+                        cat("   maximum frequency =", max_tf, "\n")
+                        elimf = c(elimf, i)
+                        next
+                }                
+                if (num_lev <= 100)
+                    {
+                    tf2 = table(train3[[i]], train3$classe)
+                    ct = chisq.test(tf2)
+                    if (ct$p.value > 0.5)
+                        {
+                            cat("chisq-test p-value=",ct$p.value, "\n")
+                            print(ct)  # chisq-test                          
+                            elimf = c(elimf, i)                           
+                        }
+                    }
+                } # factor 
+    } # loop 
+train4 = train3[,-elimf]
+dim4 = dim(train4)
+dim4                    # remaining: 40 variables 
+```
+
+#### Step 5: Prediction with Random Forest 
+
+We use a Random Forest prediction and PCA Pre-processing 
+(as suggested in one of the lectures)
+Then we check the accuracy on the reduced training set 
+and the separate cross validation set (cv0)
+The out-of-sample error can be estimated from the accuracy on the cv set. 
+
+```{r Predict_1,warning=FALSE, comment=""}
+library(caret)
+
+accuracy = function(predicted, observed)
+    {
+        ok = sum(predicted == observed)
+        total = length(observed)
+        ok/total   # accuracy
+    }
+
+# random forest 
+fit2 = train(classe ~., 
+                  method="rf",
+                  preProcess="pca",   # request pre-processing
+                  data=train4)
+fit2
+```
+
+We see that we achieve a very high accuracy.
+The in-sample error is practically 0, but more importantly, 
+the "out-of-band" error obtained from the final model, is about 2%. 
+
+```{r Predict_2,warning=FALSE, comment=""}
+fit2.pred = predict(fit2, train4)    # predict for rf model
+accuracy(fit2.pred, train4$classe)   # compare  
+
+# statistics per class 
+confusionMatrix(train4$classe, fit2.pred)
+
+fit2$finalModel
+```
+
+Finally we apply the prediction to the CV set and see that the 
+accuracy is very high again. 
+**We get the same "out of sample" error of about 2%.**
+
+```{r Predict_3,warning=FALSE, comment=""}
+# apply to cv set 
+fit2.pred.cv = predict(fit2, cv0)
+accuracy(fit2.pred.cv, cv0$classe)   # 0.9765
+confusionMatrix(cv0$classe, fit2.pred.cv)
+```
+
+#### Step 6: Apply to the 20 test cases
+
+The actual submission of the test cases has shown that the error rate is very 
+much in line with the expected "out of sample" error rate. It was 1 of 20 cases 
+(=95% accuracy)
+
+```{r Testing_1}
+# url_test = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+destfile_test = "PML Wearable.test.csv"
+# download.file(url_test, destfile_test)
+
+test0 = read.csv(destfile_test)
+
+fit2.test = predict(fit2, test0)
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("Submit2/problem_id_",i,".txt")
+    write.table(x[i],file=filename,
+                quote=FALSE,
+                row.names=FALSE,
+                col.names=FALSE)
+  } # for 
+} # function 
+
+# original run: all answers are correct except answer 3 
+answers = as.character(fit2.test)
+pml_write_files(answers)
+
+```
